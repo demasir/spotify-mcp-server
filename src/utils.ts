@@ -7,7 +7,13 @@ import { SpotifyApi } from '@spotify/web-api-ts-sdk';
 import open from 'open';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_FILE = path.join(__dirname, '../spotify-config.json');
+
+// SPOTIFY_CONFIG_PATH overrides the default location. Used by the Claude
+// Code plugin to persist auth in ${CLAUDE_PLUGIN_DATA} (which survives
+// plugin updates) instead of the build dir (which doesn't).
+const CONFIG_FILE =
+  process.env.SPOTIFY_CONFIG_PATH ||
+  path.join(__dirname, '../spotify-config.json');
 
 export interface SpotifyConfig {
   clientId: string;
