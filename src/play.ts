@@ -182,14 +182,15 @@ const createPlaylist: tool<{
   handler: async (args, _extra: SpotifyHandlerExtra) => {
     const { name, description, public: isPublic = false } = args;
 
-    const result = await handleSpotifyRequest(async (spotifyApi) => {
-      const me = await spotifyApi.currentUser.profile();
-
-      return await spotifyApi.playlists.createPlaylist(me.id, {
-        name,
-        description,
-        public: isPublic,
-      });
+    // Hit /me/playlists directly: see spotifyFetch JSDoc for context.
+    // The SDK's createPlaylist posts to /users/{id}/playlists, which 403s
+    // for new Development Mode apps since the late-2024 endpoint consolidation.
+    const result = await spotifyFetch<{
+      id: string;
+      external_urls: { spotify: string };
+    }>('me/playlists', {
+      method: 'POST',
+      body: { name, description, public: isPublic },
     });
 
     return {
