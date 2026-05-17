@@ -11,26 +11,32 @@ const CONFIG_FILE = path.join(__dirname, '../spotify-config.json');
 
 export interface SpotifyConfig {
   clientId: string;
-  clientSecret: string;
-  redirectUri: string;
+  // Optional: when present, auth uses Authorization Code with client secret;
+  // when absent, auth uses Authorization Code with PKCE (recommended for
+  // public clients like CLI/desktop apps where secrets cannot be safely stored).
+  clientSecret?: string;
+  redirectUri?: string;
   accessToken?: string;
   refreshToken?: string;
   expiresAt?: number; // Unix timestamp in milliseconds
 }
 
+const DEFAULT_REDIRECT_URI = 'http://127.0.0.1:8888/callback';
+
 export function loadSpotifyConfig(): SpotifyConfig {
   if (!fs.existsSync(CONFIG_FILE)) {
     throw new Error(
-      `Spotify configuration file not found at ${CONFIG_FILE}. Please create one with clientId, clientSecret, and redirectUri.`,
+      `Spotify configuration file not found at ${CONFIG_FILE}. Please create one with a clientId (clientSecret is optional — omit it to use PKCE auth).`,
     );
   }
 
   try {
     const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-    if (!(config.clientId && config.clientSecret && config.redirectUri)) {
-      throw new Error(
-        'Spotify configuration must include clientId, clientSecret, and redirectUri.',
-      );
+    if (!config.clientId) {
+      throw new Error('Spotify configuration must include clientId.');
+    }
+    if (!config.redirectUri) {
+      config.redirectUri = DEFAULT_REDIRECT_URI;
     }
     return config;
   } catch (error) {
@@ -164,13 +170,20 @@ export async function createSpotifyApi(): Promise<SpotifyApi> {
     return cachedSpotifyApi;
   }
 
-  // Fallback to client credentials if no user tokens available
-  cachedSpotifyApi = SpotifyApi.withClientCredentials(
-    config.clientId,
-    config.clientSecret,
-  );
+  // Fallback to client credentials if no user tokens available.
+  // Requires clientSecret — public clients (PKCE only) must complete the
+  // authorization flow before any API calls.
+  if (config.clientSecret) {
+    cachedSpotifyApi = SpotifyApi.withClientCredentials(
+      config.clientId,
+      config.clientSecret,
+    );
+    return cachedSpotifyApi;
+  }
 
-  return cachedSpotifyApi;
+  throw new Error(
+    'No access token available. Run the auth flow first (e.g. `npm run auth` or `/spotify-set-reorder:setup`).',
+  );
 }
 
 function generateRandomString(length: number): string {
@@ -189,28 +202,59 @@ function base64Encode(str: string): string {
   return Buffer.from(str).toString('base64');
 }
 
+function base64UrlEncode(buffer: Buffer): string {
+  return buffer
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+function generateCodeVerifier(): string {
+  // RFC 7636: 43-128 char URL-safe random string
+  return base64UrlEncode(crypto.randomBytes(64));
+}
+
+function generateCodeChallenge(verifier: string): string {
+  return base64UrlEncode(crypto.createHash('sha256').update(verifier).digest());
+}
+
 async function exchangeCodeForToken(
   code: string,
   config: SpotifyConfig,
+  codeVerifier: string | undefined,
 ): Promise<{
   access_token: string;
   refresh_token: string;
   expires_in: number;
 }> {
   const tokenUrl = 'https://accounts.spotify.com/api/token';
-  const authHeader = `Basic ${base64Encode(`${config.clientId}:${config.clientSecret}`)}`;
-
   const params = new URLSearchParams();
   params.append('grant_type', 'authorization_code');
   params.append('code', code);
-  params.append('redirect_uri', config.redirectUri);
+  params.append('redirect_uri', config.redirectUri ?? DEFAULT_REDIRECT_URI);
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/x-www-form-urlencoded',
+  };
+
+  if (config.clientSecret) {
+    // Legacy: confidential client with Basic auth
+    headers.Authorization = `Basic ${base64Encode(`${config.clientId}:${config.clientSecret}`)}`;
+  } else {
+    // PKCE: public client, no secret — send client_id + code_verifier in body
+    if (!codeVerifier) {
+      throw new Error(
+        'PKCE auth requires a code_verifier when no clientSecret is configured',
+      );
+    }
+    params.append('client_id', config.clientId);
+    params.append('code_verifier', codeVerifier);
+  }
 
   const response = await fetch(tokenUrl, {
     method: 'POST',
-    headers: {
-      Authorization: authHeader,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
+    headers,
     body: params,
   });
 
@@ -235,18 +279,24 @@ async function refreshAccessToken(
   }
 
   const tokenUrl = 'https://accounts.spotify.com/api/token';
-  const authHeader = `Basic ${base64Encode(`${config.clientId}:${config.clientSecret}`)}`;
-
   const params = new URLSearchParams();
   params.append('grant_type', 'refresh_token');
   params.append('refresh_token', config.refreshToken);
 
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/x-www-form-urlencoded',
+  };
+
+  if (config.clientSecret) {
+    headers.Authorization = `Basic ${base64Encode(`${config.clientId}:${config.clientSecret}`)}`;
+  } else {
+    // PKCE refresh: client_id goes in the body, no Basic auth
+    params.append('client_id', config.clientId);
+  }
+
   const response = await fetch(tokenUrl, {
     method: 'POST',
-    headers: {
-      Authorization: authHeader,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
+    headers,
     body: params,
   });
 
@@ -265,7 +315,7 @@ async function refreshAccessToken(
 export async function authorizeSpotify(): Promise<void> {
   const config = loadSpotifyConfig();
 
-  const redirectUri = new URL(config.redirectUri);
+  const redirectUri = new URL(config.redirectUri ?? DEFAULT_REDIRECT_URI);
   if (
     redirectUri.hostname !== 'localhost' &&
     redirectUri.hostname !== '127.0.0.1'
@@ -284,6 +334,13 @@ export async function authorizeSpotify(): Promise<void> {
   const callbackPath = redirectUri.pathname || '/callback';
 
   const state = generateRandomString(16);
+
+  // PKCE: only generated when no clientSecret is configured. Legacy
+  // Authorization Code (with secret) still works for existing configs.
+  const codeVerifier = config.clientSecret ? undefined : generateCodeVerifier();
+  const codeChallenge = codeVerifier
+    ? generateCodeChallenge(codeVerifier)
+    : undefined;
 
   const scopes = [
     'user-read-private',
@@ -305,11 +362,15 @@ export async function authorizeSpotify(): Promise<void> {
   const authParams = new URLSearchParams({
     client_id: config.clientId,
     response_type: 'code',
-    redirect_uri: config.redirectUri,
+    redirect_uri: config.redirectUri ?? DEFAULT_REDIRECT_URI,
     scope: scopes.join(' '),
     state: state,
     show_dialog: 'true',
   });
+  if (codeChallenge) {
+    authParams.append('code_challenge_method', 'S256');
+    authParams.append('code_challenge', codeChallenge);
+  }
 
   const authorizationUrl = `https://accounts.spotify.com/authorize?${authParams.toString()}`;
 
@@ -360,7 +421,7 @@ export async function authorizeSpotify(): Promise<void> {
         }
 
         try {
-          const tokens = await exchangeCodeForToken(code, config);
+          const tokens = await exchangeCodeForToken(code, config, codeVerifier);
 
           config.accessToken = tokens.access_token;
           config.refreshToken = tokens.refresh_token;
